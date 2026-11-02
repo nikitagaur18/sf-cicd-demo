@@ -1,0 +1,102 @@
+# .github/workflows/deploy.yml
+#
+# Runs when a PR is merged into qa (i.e. a push lands on qa).
+# Uses sfdx-git-delta to work out ONLY the metadata changed by that merge,
+# then deploys it to the QA org - including deletions.
+# main is the release branch; there is no org behind it yet.
+
+name: Deploy to QA
+
+on:
+  push:
+    branches: [qa]
+
+concurrency:
+  group: deploy-qa
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SF_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_QA }}
+
+    steps:
+      - name: Checkout (full history, needed for git diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Salesforce CLI and sfdx-git-delta
+        run: |
+          npm install --global @salesforce/cli
+          echo y | sf plugins install sfdx-git-delta
+          sf plugins
+
+      - name: Work out the commit range for this push
+        id: range
+        run: |
+          FROM="${{ github.event.before }}"
+          # Brand-new branch or forced push: fall back to the previous commit
+          if [ -z "$FROM" ] || [ "$FROM" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$FROM" 2>/dev/null; then
+            FROM="HEAD~1"
+          fi
+          echo "from=$FROM" >> "$GITHUB_OUTPUT"
+          echo "Delta range: $FROM -> ${{ github.sha }}"
+
+      - name: Build delta (what this merge changed)
+        run: |
+          mkdir -p delta
+          sf sgd source delta \
+            --from "${{ steps.range.outputs.from }}" \
+            --to "${{ github.sha }}" \
+            --output-dir delta \
+            --generate-delta \
+            --source-dir force-app
+          echo "----- package.xml (to deploy) -----"
+          cat delta/package/package.xml
+          echo "----- destructiveChanges.xml (to delete) -----"
+          cat delta/destructiveChanges/destructiveChanges.xml
+
+      - name: Check whether there is anything to deploy
+        id: changes
+        run: |
+          if grep -q '<types>' delta/package/package.xml; then has_deploy=true; else has_deploy=false; fi
+          if grep -q '<types>' delta/destructiveChanges/destructiveChanges.xml; then has_destroy=true; else has_destroy=false; fi
+          echo "has_destroy=$has_destroy" >> "$GITHUB_OUTPUT"
+          if [ "$has_deploy" = true ] || [ "$has_destroy" = true ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Salesforce metadata changes in this merge - nothing to deploy."
+          fi
+
+      - name: Authenticate to QA org
+        if: steps.changes.outputs.any == 'true'
+        run: |
+          if [ -z "$SF_AUTH_URL" ]; then
+            echo "::error::Repository secret SFDX_AUTH_URL_QA is not set."
+            exit 1
+          fi
+          echo "$SF_AUTH_URL" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias qa
+          rm -f auth.txt
+
+      - name: Deploy delta to QA
+        if: steps.changes.outputs.any == 'true'
+        run: |
+          EXTRA=""
+          if [ "${{ steps.changes.outputs.has_destroy }}" = "true" ]; then
+            EXTRA="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $EXTRA \
+            --target-org qa \
+            --test-level RunLocalTests \
+            --wait 30

@@ -1,0 +1,92 @@
+# .github/workflows/pr-validate.yml
+#
+# Runs on every pull request into qa (typically dev -> qa).
+# Uses sfdx-git-delta to work out ONLY the metadata that differs from qa,
+# then does a check-only (dry-run) deploy + Apex tests against the QA org.
+# Nothing is actually deployed - this proves the change is safe to merge.
+
+name: Validate PR
+
+on:
+  pull_request:
+    branches: [qa]
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      SF_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_QA }}
+
+    steps:
+      - name: Checkout (full history, needed for git diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Salesforce CLI and sfdx-git-delta
+        run: |
+          npm install --global @salesforce/cli
+          echo y | sf plugins install sfdx-git-delta
+          sf plugins
+
+      - name: Build delta (what changed vs qa)
+        run: |
+          mkdir -p delta
+          sf sgd source delta \
+            --from "origin/${{ github.base_ref }}" \
+            --to "HEAD" \
+            --output-dir delta \
+            --generate-delta \
+            --source-dir force-app
+          echo "----- package.xml (to deploy) -----"
+          cat delta/package/package.xml
+          echo "----- destructiveChanges.xml (to delete) -----"
+          cat delta/destructiveChanges/destructiveChanges.xml
+
+      - name: Check whether there is anything to validate
+        id: changes
+        run: |
+          if grep -q '<types>' delta/package/package.xml; then has_deploy=true; else has_deploy=false; fi
+          if grep -q '<types>' delta/destructiveChanges/destructiveChanges.xml; then has_destroy=true; else has_destroy=false; fi
+          echo "has_destroy=$has_destroy" >> "$GITHUB_OUTPUT"
+          if [ "$has_deploy" = true ] || [ "$has_destroy" = true ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Salesforce metadata changes in this PR - nothing to validate."
+          fi
+
+      - name: Authenticate to QA org
+        if: steps.changes.outputs.any == 'true'
+        run: |
+          if [ -z "$SF_AUTH_URL" ]; then
+            echo "::error::Repository secret SFDX_AUTH_URL_QA is not set."
+            exit 1
+          fi
+          echo "$SF_AUTH_URL" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias qa
+          rm -f auth.txt
+
+      - name: Validate delta against QA (dry run + tests)
+        if: steps.changes.outputs.any == 'true'
+        run: |
+          EXTRA=""
+          if [ "${{ steps.changes.outputs.has_destroy }}" = "true" ]; then
+            EXTRA="--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $EXTRA \
+            --target-org qa \
+            --dry-run \
+            --test-level RunLocalTests \
+            --wait 30
