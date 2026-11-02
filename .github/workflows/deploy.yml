@@ -1,15 +1,11 @@
 # .github/workflows/deploy.yml
-#
-# Runs when a PR is merged into QA (i.e. a push lands on QA).
-# Uses sfdx-git-delta to work out ONLY the metadata changed by that merge,
-# then deploys it to the QA org - including deletions.
-# main is the release branch; there is no org behind it yet.
+
 
 name: Deploy to QA
 
 on:
   push:
-    branches: [QA]   # exact branch name - GitHub matches case
+    branches: [QA]  
 
 concurrency:
   group: deploy-qa
@@ -23,12 +19,12 @@ jobs:
 
     steps:
       - name: Checkout (full history, needed for git diff)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -57,7 +53,8 @@ jobs:
             --to "${{ github.sha }}" \
             --output-dir delta \
             --generate-delta \
-            --source-dir force-app
+            --source-dir force-app \
+            --ignore-file .forceignore
           echo "----- package.xml (to deploy) -----"
           cat delta/package/package.xml
           echo "----- destructiveChanges.xml (to delete) -----"
@@ -100,3 +97,41 @@ jobs:
             --target-org qa \
             --test-level RunLocalTests \
             --wait 30
+
+#dev-sync
+  sync-dev:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Merge QA into Dev
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+
+          git checkout Dev
+          if git merge --no-edit origin/QA; then
+            git push origin Dev
+            echo "::notice::Dev is now in sync with QA."
+          else
+            git merge --abort
+            BRANCH="sync/qa-to-dev-${{ github.run_number }}"
+            git checkout -b "$BRANCH" origin/QA
+            git push origin "$BRANCH"
+            gh pr create \
+              --base Dev \
+              --head "$BRANCH" \
+              --title "Sync QA into Dev (conflict to resolve)" \
+              --body "Automatic sync of QA into Dev hit a merge conflict after run ${{ github.run_number }}. Resolve the conflict in this PR and merge it. Nothing on Dev was overwritten."
+            echo "::warning::Could not merge QA into Dev automatically. Opened a PR from $BRANCH into Dev to resolve the conflict."
+          fi
