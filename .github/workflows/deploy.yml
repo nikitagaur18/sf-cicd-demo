@@ -1,6 +1,6 @@
 # .github/workflows/deploy.yml
 #
-# Runs when a PR is merged into qa (i.e. a push lands on qa).
+# Runs when a PR is merged into QA (i.e. a push lands on QA).
 # Uses sfdx-git-delta to work out ONLY the metadata changed by that merge,
 # then deploys it to the QA org - including deletions.
 # main is the release branch; there is no org behind it yet.
@@ -9,7 +9,7 @@ name: Deploy to QA
 
 on:
   push:
-    branches: [qa]
+    branches: [QA]   # exact branch name - GitHub matches case
 
 concurrency:
   group: deploy-qa
